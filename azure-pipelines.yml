@@ -1,52 +1,90 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
+# Deploy to Azure Kubernetes Service
+# Build and push image to Azure Container Registry; Deploy to Azure Kubernetes Service
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
 
 trigger:
 - main
-- feature/aks
 
-pool: 
-  vmImage: ubuntu-latest
+resources:
+- repo: self
+
 variables:
-  -group: terraform
-  -name: subscription_id
-   value:$[variable.subscription_id]
-  -name: tenant_id
-   value:$[variable.tenant_id]
-steps:
-- task: TerraformInstaller@1
-  inputs:
-    terraformVersion: 'latest'
-- task: TerraformTaskV4@4
-  inputs:
-    provider: 'azurerm'
-    command: 'init'
-    backendServiceArm: 'Free Trial(1)(6e0bd79b-1d94-4cb0-aea2-ef7a6d11eeef)'
-    backendAzureRmResourceGroupName: 'tharanirg'
-    backendAzureRmStorageAccountName: 'strgfile'
-    backendAzureRmContainerName: 'terraform'
-    backendAzureRmKey: 'terraform.tfstate'
 
-- task: TerraformTaskV4@4
-  inputs:
-    provider: 'azurerm'
-    command: 'validate'
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: '7a869fe8-eb85-4ffe-8b16-1d296a24ee27'
+  imageRepository: 'dotnet'
+  containerRegistry: 'jenacr.azurecr.io'
+  dockerfilePath: '**/Dockerfile'
+  tag: '$(Build.BuildId)'
+  imagePullSecret: 'jenacrca58-auth'
 
-- task: TerraformTaskV4@4
-  inputs:
-    provider: 'azurerm'
-    command: 'plan'
-    environmentServiceNameAzureRM: 'Free Trial(2)(6e0bd79b-1d94-4cb0-aea2-ef7a6d11eeef)'
-    
-- task: PowerShell@2
-  env:
-  ARM_CLIENT_SECRET = "null"
-  ARM_CLIENT_ID = "null"
-  ARM_SUBSCRIPTION_ID = $(subscription_id)
-  ARM_TENANT_ID = $(tenant_id)
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
 
-  inputs:
-    targetType: 'inline'
-    script: 'terraform apply'
+
+stages:
+- stage: Build
+  displayName: Build stage
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: Docker@2
+      displayName: Build and push an image to container registry
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+
+    #- upload: manifests
+     # artifact: manifests
+      
+    - task: CopyFiles@2
+      inputs:
+        SourceFolder: 'manifests/'
+        Contents: '**/*.yml'
+        TargetFolder: '$(Pipeline.Workspace)/manifests'
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(Pipeline.Workspace)/manifests'
+        artifact: 'manifests'
+        publishLocation: 'pipeline'
+
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: Build
+
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'dotnet.default'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            displayName: Create imagePullSecret
+            inputs:
+              action: createSecret
+              secretName: $(imagePullSecret)
+              dockerRegistryEndpoint: $(dockerRegistryServiceConnection)
+
+          - task: KubernetesManifest@0
+            displayName: Deploy to Kubernetes cluster
+            inputs:
+              action: deploy
+              manifests: |
+                $(Pipeline.Workspace)/manifests/deployment.yml
+                $(Pipeline.Workspace)/manifests/service.yml
+              imagePullSecrets: |
+                $(imagePullSecret)
+              containers: |
+                $(containerRegistry)/$(imageRepository):$(tag)
+
